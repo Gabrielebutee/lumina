@@ -1,4 +1,4 @@
-;; Enhanced Lumina Art NFT Marketplace with Dynamic Royalties and Auctions
+;; Enhanced Lumina Art NFT Marketplace with Dynamic Royalties, Auctions, and Batch Operations
 
 ;; Data Maps - Original
 (define-map lumina-royalties uint (tuple (creator principal) (percent uint)))
@@ -45,6 +45,7 @@
 (define-constant LUMINA-MAX-MARKETPLACE-FEE u1000) ;; 10% in basis points
 (define-constant LUMINA-BASIS-POINTS u10000) ;; 100% = 10000 basis points
 (define-constant LUMINA-MAX-CREATORS u10)
+(define-constant LUMINA-MAX-BATCH-SIZE u20) ;; Maximum batch size for operations
 
 ;; Error Constants - Original
 (define-constant ERR-LUMINA-NOT-AUTHORIZED u403)
@@ -64,6 +65,8 @@
 (define-constant ERR-LUMINA-AUCTION-NOT-FOUND u414)
 (define-constant ERR-LUMINA-INVALID-DURATION u415)
 (define-constant ERR-LUMINA-RESERVE-NOT-MET u416)
+(define-constant ERR-LUMINA-INVALID-INPUT u417)
+(define-constant ERR-LUMINA-BATCH-SIZE-EXCEEDED u418)
 
 ;; Private Functions - Original
 (define-private (lumina-is-valid-principal (address principal))
@@ -181,6 +184,85 @@
             (ok true)
         )
     )
+)
+
+;; Private Functions - New: Batch Operation Helpers
+(define-private (mint-single-nft (mint-data {recipient: principal, percent: uint, uri: (string-ascii 256)}) (acc-result (response {success-count: uint, failed-ids: (list 20 uint)} uint)))
+    (match acc-result
+        acc-data
+        (let ((id (var-get lumina-next-id)))
+            (match (mint-lumina-art (get recipient mint-data) (get percent mint-data) (get uri mint-data))
+                success (ok {
+                    success-count: (+ (get success-count acc-data) u1),
+                    failed-ids: (get failed-ids acc-data)
+                })
+                error (ok {
+                    success-count: (get success-count acc-data),
+                    failed-ids: (unwrap-panic (as-max-len? (append (get failed-ids acc-data) id) u20))
+                })))
+        error (err error))
+)
+
+(define-private (list-single-nft (list-data {id: uint, price: uint}) (acc-result (response {success-count: uint, failed-ids: (list 20 uint)} uint)))
+    (match acc-result
+        acc-data
+        (match (list-lumina-art (get id list-data) (get price list-data))
+            success (ok {
+                success-count: (+ (get success-count acc-data) u1),
+                failed-ids: (get failed-ids acc-data)
+            })
+            error (ok {
+                success-count: (get success-count acc-data),
+                failed-ids: (unwrap-panic (as-max-len? (append (get failed-ids acc-data) (get id list-data)) u20))
+            }))
+        error (err error))
+)
+
+(define-private (delist-single-nft (id uint) (acc-result (response {success-count: uint, failed-ids: (list 20 uint)} uint)))
+    (match acc-result
+        acc-data
+        (match (delist-lumina-art id)
+            success (ok {
+                success-count: (+ (get success-count acc-data) u1),
+                failed-ids: (get failed-ids acc-data)
+            })
+            error (ok {
+                success-count: (get success-count acc-data),
+                failed-ids: (unwrap-panic (as-max-len? (append (get failed-ids acc-data) id) u20))
+            }))
+        error (err error))
+)
+
+(define-private (transfer-single-nft (transfer-data {id: uint, recipient: principal}) (acc-result (response {success-count: uint, failed-ids: (list 20 uint)} uint)))
+    (match acc-result
+        acc-data
+        (match (transfer-lumina-art (get id transfer-data) (get recipient transfer-data))
+            success (ok {
+                success-count: (+ (get success-count acc-data) u1),
+                failed-ids: (get failed-ids acc-data)
+            })
+            error (ok {
+                success-count: (get success-count acc-data),
+                failed-ids: (unwrap-panic (as-max-len? (append (get failed-ids acc-data) (get id transfer-data)) u20))
+            }))
+        error (err error))
+)
+
+;; Private Functions - Gas Optimization Helpers
+(define-private (lumina-bulk-validate-ownership (ids (list 20 uint)) (owner principal))
+    (fold lumina-check-single-ownership ids true)
+)
+
+(define-private (lumina-check-single-ownership (id uint) (acc-valid bool))
+    (and acc-valid (is-eq (some tx-sender) (nft-get-owner? lumina-art-nft id)))
+)
+
+(define-private (lumina-bulk-validate-prices (prices (list 20 uint)))
+    (fold lumina-check-single-price prices true)
+)
+
+(define-private (lumina-check-single-price (price uint) (acc-valid bool))
+    (and acc-valid (> price u0))
 )
 
 ;; Public Functions - Original (Enhanced)
@@ -362,6 +444,144 @@
     )
 )
 
+;; Public Functions - New: Batch Operations
+(define-public (batch-mint-lumina-art (recipients (list 20 principal)) (percents (list 20 uint)) (uris (list 20 (string-ascii 256))))
+    (let ((recipients-count (len recipients))
+          (percents-count (len percents))
+          (uris-count (len uris)))
+        (begin
+            ;; Validate input lengths match
+            (asserts! (and (is-eq recipients-count percents-count) (is-eq recipients-count uris-count)) (err ERR-LUMINA-INVALID-INPUT))
+            (asserts! (<= recipients-count LUMINA-MAX-BATCH-SIZE) (err ERR-LUMINA-BATCH-SIZE-EXCEEDED))
+            (asserts! (> recipients-count u0) (err ERR-LUMINA-INVALID-INPUT))
+            (asserts! (not (var-get lumina-contract-paused)) (err ERR-LUMINA-CONTRACT-PAUSED))
+            
+            ;; Create mint data list
+            (let ((mint-data-list (map create-mint-data-tuple recipients percents uris)))
+                (let ((result (fold mint-single-nft mint-data-list (ok {success-count: u0, failed-ids: (list)}))))
+                    (match result
+                        success-data (begin
+                            (print {event: "lumina-batch-mint", success-count: (get success-count success-data), failed-ids: (get failed-ids success-data)})
+                            (ok success-data))
+                        error (err error))))
+        )
+    )
+)
+
+(define-public (batch-list-lumina-art (ids (list 20 uint)) (prices (list 20 uint)))
+    (let ((ids-count (len ids))
+          (prices-count (len prices)))
+        (begin
+            ;; Validate input lengths match
+            (asserts! (is-eq ids-count prices-count) (err ERR-LUMINA-INVALID-INPUT))
+            (asserts! (<= ids-count LUMINA-MAX-BATCH-SIZE) (err ERR-LUMINA-BATCH-SIZE-EXCEEDED))
+            (asserts! (> ids-count u0) (err ERR-LUMINA-INVALID-INPUT))
+            (asserts! (not (var-get lumina-contract-paused)) (err ERR-LUMINA-CONTRACT-PAUSED))
+            
+            ;; Bulk validation for gas optimization
+            (asserts! (lumina-bulk-validate-prices prices) (err ERR-LUMINA-INVALID-PRICE))
+            
+            ;; Create list data list
+            (let ((list-data-list (map create-list-data-tuple ids prices)))
+                (let ((result (fold list-single-nft list-data-list (ok {success-count: u0, failed-ids: (list)}))))
+                    (match result
+                        success-data (begin
+                            (print {event: "lumina-batch-list", success-count: (get success-count success-data), failed-ids: (get failed-ids success-data)})
+                            (ok success-data))
+                        error (err error))))
+        )
+    )
+)
+
+(define-public (batch-delist-lumina-art (ids (list 20 uint)))
+    (let ((ids-count (len ids)))
+        (begin
+            (asserts! (<= ids-count LUMINA-MAX-BATCH-SIZE) (err ERR-LUMINA-BATCH-SIZE-EXCEEDED))
+            (asserts! (> ids-count u0) (err ERR-LUMINA-INVALID-INPUT))
+            (asserts! (not (var-get lumina-contract-paused)) (err ERR-LUMINA-CONTRACT-PAUSED))
+            
+            (let ((result (fold delist-single-nft ids (ok {success-count: u0, failed-ids: (list)}))))
+                (match result
+                    success-data (begin
+                        (print {event: "lumina-batch-delist", success-count: (get success-count success-data), failed-ids: (get failed-ids success-data)})
+                        (ok success-data))
+                    error (err error)))
+        )
+    )
+)
+
+(define-public (batch-transfer-lumina-art (ids (list 20 uint)) (recipients (list 20 principal)))
+    (let ((ids-count (len ids))
+          (recipients-count (len recipients)))
+        (begin
+            ;; Validate input lengths match
+            (asserts! (is-eq ids-count recipients-count) (err ERR-LUMINA-INVALID-INPUT))
+            (asserts! (<= ids-count LUMINA-MAX-BATCH-SIZE) (err ERR-LUMINA-BATCH-SIZE-EXCEEDED))
+            (asserts! (> ids-count u0) (err ERR-LUMINA-INVALID-INPUT))
+            (asserts! (not (var-get lumina-contract-paused)) (err ERR-LUMINA-CONTRACT-PAUSED))
+            
+            ;; Create transfer data list
+            (let ((transfer-data-list (map create-transfer-data-tuple ids recipients)))
+                (let ((result (fold transfer-single-nft transfer-data-list (ok {success-count: u0, failed-ids: (list)}))))
+                    (match result
+                        success-data (begin
+                            (print {event: "lumina-batch-transfer", success-count: (get success-count success-data), failed-ids: (get failed-ids success-data)})
+                            (ok success-data))
+                        error (err error))))
+        )
+    )
+)
+
+;; Helper functions for batch operations
+(define-private (create-mint-data-tuple (recipient principal) (percent uint) (uri (string-ascii 256)))
+    {recipient: recipient, percent: percent, uri: uri}
+)
+
+(define-private (create-list-data-tuple (id uint) (price uint))
+    {id: id, price: price}
+)
+
+(define-private (create-transfer-data-tuple (id uint) (recipient principal))
+    {id: id, recipient: recipient}
+)
+
+;; Public Functions - New: Gas Optimization Functions
+(define-public (bulk-update-listing-prices (ids (list 20 uint)) (new-prices (list 20 uint)))
+    (let ((ids-count (len ids))
+          (prices-count (len new-prices)))
+        (begin
+            (asserts! (is-eq ids-count prices-count) (err ERR-LUMINA-INVALID-INPUT))
+            (asserts! (<= ids-count LUMINA-MAX-BATCH-SIZE) (err ERR-LUMINA-BATCH-SIZE-EXCEEDED))
+            (asserts! (> ids-count u0) (err ERR-LUMINA-INVALID-INPUT))
+            (asserts! (not (var-get lumina-contract-paused)) (err ERR-LUMINA-CONTRACT-PAUSED))
+            (asserts! (lumina-bulk-validate-prices new-prices) (err ERR-LUMINA-INVALID-PRICE))
+            
+            (let ((update-data-list (map create-list-data-tuple ids new-prices)))
+                (let ((result (fold update-single-price update-data-list (ok {success-count: u0, failed-ids: (list)}))))
+                    (match result
+                        success-data (begin
+                            (print {event: "lumina-bulk-price-update", success-count: (get success-count success-data), failed-ids: (get failed-ids success-data)})
+                            (ok success-data))
+                        error (err error))))
+        )
+    )
+)
+
+(define-private (update-single-price (update-data {id: uint, price: uint}) (acc-result (response {success-count: uint, failed-ids: (list 20 uint)} uint)))
+    (match acc-result
+        acc-data
+        (match (update-lumina-listing-price (get id update-data) (get price update-data))
+            success (ok {
+                success-count: (+ (get success-count acc-data) u1),
+                failed-ids: (get failed-ids acc-data)
+            })
+            error (ok {
+                success-count: (get success-count acc-data),
+                failed-ids: (unwrap-panic (as-max-len? (append (get failed-ids acc-data) (get id update-data)) u20))
+            }))
+        error (err error))
+)
+
 ;; Public Functions - New: Dynamic Royalty System
 (define-public (set-lumina-creator-splits (id uint) (creators (list 10 {creator: principal, percentage: uint})))
     (begin
@@ -472,25 +692,25 @@
             (asserts! (>= stacks-block-height (get end-block auction)) (err ERR-LUMINA-AUCTION-ENDED))
             
             (match (get highest-bidder auction)
-    winner (begin
-        ;; Check reserve price met
-        (if (>= (get current-bid auction) (get reserve-price auction))
-            (begin
-                ;; Transfer NFT to winner
-                (try! (as-contract (nft-transfer? lumina-art-nft id (get seller auction) winner)))
-                ;; Process payment with fees
-                (try! (lumina-process-auction-payment id (get current-bid auction) (get seller auction)))
-                (print {event: "lumina-auction-settled", token-id: id, winner: winner, final-price: (get current-bid auction)})
-                true)
-            (begin
-                ;; Reserve not met, refund highest bidder
-                (try! (as-contract (stx-transfer? (get current-bid auction) tx-sender winner)))
-                (print {event: "lumina-auction-reserve-not-met", token-id: id, final-bid: (get current-bid auction), reserve: (get reserve-price auction)})
-                true)))
-    ;; No bids, auction ends without sale
-    (begin
-        (print {event: "lumina-auction-no-bids", token-id: id})
-        true))
+                winner (begin
+                    ;; Check reserve price met
+                    (if (>= (get current-bid auction) (get reserve-price auction))
+                        (begin
+                            ;; Transfer NFT to winner
+                            (try! (as-contract (nft-transfer? lumina-art-nft id (get seller auction) winner)))
+                            ;; Process payment with fees
+                            (try! (lumina-process-auction-payment id (get current-bid auction) (get seller auction)))
+                            (print {event: "lumina-auction-settled", token-id: id, winner: winner, final-price: (get current-bid auction)})
+                            true)
+                        (begin
+                            ;; Reserve not met, refund highest bidder
+                            (try! (as-contract (stx-transfer? (get current-bid auction) tx-sender winner)))
+                            (print {event: "lumina-auction-reserve-not-met", token-id: id, final-bid: (get current-bid auction), reserve: (get reserve-price auction)})
+                            true)))
+                ;; No bids, auction ends without sale
+                (begin
+                    (print {event: "lumina-auction-no-bids", token-id: id})
+                    true))
             
             ;; Mark auction as inactive
             (map-set lumina-auctions id (merge auction {active: false}))
@@ -641,4 +861,36 @@
                    (ok (some (- (get end-block auction) stacks-block-height)))
                    (ok none))
         (ok none))
+)
+
+;; Read-only Functions - New: Batch Operation Helpers
+(define-read-only (get-lumina-batch-settings)
+    (ok {
+        max-batch-size: LUMINA-MAX-BATCH-SIZE
+    })
+)
+
+(define-read-only (bulk-get-lumina-listings (ids (list 20 uint)))
+    (ok (map get-single-listing ids))
+)
+
+(define-read-only (bulk-get-lumina-auctions (ids (list 20 uint)))
+    (ok (map get-single-auction ids))
+)
+
+(define-read-only (bulk-get-lumina-royalties (ids (list 20 uint)))
+    (ok (map get-single-royalty ids))
+)
+
+;; Helper functions for bulk read operations
+(define-private (get-single-listing (id uint))
+    (map-get? lumina-listings id)
+)
+
+(define-private (get-single-auction (id uint))
+    (map-get? lumina-auctions id)
+)
+
+(define-private (get-single-royalty (id uint))
+    (map-get? lumina-royalties id)
 )
